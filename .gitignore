@@ -2,3 +2,4 @@
 .helix
 target/
 build/
+*.bin

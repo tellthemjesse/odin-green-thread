@@ -1,29 +1,34 @@
-package gt
+package fibers
 
-import "base:runtime"
-import "core:fmt"
 import "core:mem"
 import "core:slice"
 import "core:sys/posix"
+import "core:testing"
 
-foreign import platform "asm/x86_64_sysv_nasm.asm"
+foreign import platform "x86_64_sysv_nasm.asm"
 
 foreign platform {
+	// Swaps the thread context
 	cx_swap :: proc(from: ^Cx, to: ^Cx) ---
-	_align :: proc() ---
+	// Assembly ret instruction to handle the gap when we return from task,
+	// so that t_return proc will get called on a 16-byte boundary
+	t_skip :: proc() ---
 }
 
 STACK_SIZE := mem.PAGE_SIZE * 4
-MAX_THREADS :: 3 // One base thread + 2 workers.
+MAX_THREADS :: #config(MAX_THREADS, 3) // The default value is one base thread + 2 workers
+RUNTIME: ^Runtime // Global runtime
 
-RUNTIME: ^Runtime
-
+// Each Thread has a Stack
 Stack :: struct {
-	base: [^]u8,
+	base: [^]u8, // Backing buffer with a guard page
 	len:  uint,
 }
 
+// Initializes the stack. Underlying buffer is created via mmap. It also comes with a guard page
 stack_init :: proc(s: ^Stack, size: int) {
+	assert(s != nil, "Expected a stack pointer.")
+
 	guard := mem.PAGE_SIZE
 	len := uint(guard + size)
 
@@ -34,11 +39,17 @@ stack_init :: proc(s: ^Stack, size: int) {
 	s.len = len
 }
 
+// Returns a pointer to the top of the stack
 stack_top :: proc(s: ^Stack) -> uintptr {
+	assert(s != nil, "Expected a stack pointer.")
+
 	return auto_cast mem.ptr_offset(s.base, s.len)
 }
 
+// Unmaps the underlying buffer
 stack_free_all :: proc(s: ^Stack) {
+	assert(s != nil, "Expected a stack pointer.")
+
 	posix.munmap(s.base, s.len)
 }
 
@@ -47,6 +58,7 @@ Runtime :: struct {
 	current: uint,
 }
 
+// Initializes the runtime
 init :: proc() {
 	assert(RUNTIME == nil, "Cannot initialize runtime more than once.")
 
@@ -66,26 +78,31 @@ init :: proc() {
 }
 
 run :: proc() {
-	for _yield() {} 	// Finishes after there's no work left to do
+	assert(RUNTIME != nil, "Runtime is not initialized.")
+
+	for t_yield() {} 	// Finishes after there's no work left to do
 
 	for t in RUNTIME.threads {
 		stack_free_all(t.stack)
 		free(t.stack)
 	}
 	delete(RUNTIME.threads)
-
-	posix.exit(0)
+	free(RUNTIME)
 }
 
-_return :: proc() {
+// Task return guard
+t_return :: proc() {
 	curr := RUNTIME.current
 	if curr != 0 {
 		RUNTIME.threads[curr].state = .Available
-		_yield()
+		t_yield()
 	}
 }
 
-_yield :: proc() -> bool {
+// Yields control back to the runtime
+t_yield :: proc() -> bool {
+	// Round-robin scheduler
+
 	pos := RUNTIME.current
 	for RUNTIME.threads[pos].state != .Ready {
 		pos += 1
@@ -109,38 +126,43 @@ _yield :: proc() -> bool {
 	return len(RUNTIME.threads) > 0
 }
 
-spawn :: proc(f: proc()) {
-	index, found := slice.linear_search_proc(
+// Spawns a task
+spawn :: proc(func: proc()) -> (ok: bool) {
+	assert(RUNTIME != nil, "Runtime is not initialized.")
+
+	index := slice.linear_search_proc(
 		RUNTIME.threads[:],
 		proc(t: Thread) -> bool {return t.state == .Available},
-	)
-
-	assert(found, "No threads available.")
+	) or_return
 
 	available := &RUNTIME.threads[index]
-	top := mem.align_backward_uintptr(stack_top(available.stack), 16)
+	ptr := mem.align_backward_uintptr(stack_top(available.stack), 16)
 
-	((^uintptr)(top - 16))^ = transmute(uintptr)_return
-	((^uintptr)(top - 24))^ = transmute(uintptr)_align
-	((^uintptr)(top - 32))^ = transmute(uintptr)f
+	((^uintptr)(ptr - 16))^ = transmute(uintptr)t_return
+	((^uintptr)(ptr - 24))^ = transmute(uintptr)t_skip
+	((^uintptr)(ptr - 32))^ = transmute(uintptr)func
 
-	available.cx.rsp = top - 32
+	available.cx.rsp = ptr - 32
 	available.state = .Ready
+
+	return true
 }
 
+// Thread state
 State :: enum {
 	Available,
 	Running,
 	Ready,
 }
 
+// Green thread
 Thread :: struct {
 	stack: ^Stack,
 	cx:    Cx,
 	state: State,
 }
 
-// Thread Context
+// Thread context
 Cx :: struct {
 	rsp: uintptr,
 	r15: uintptr,
@@ -151,26 +173,18 @@ Cx :: struct {
 	rbp: uintptr,
 }
 
-main :: proc() {
+@(test)
+spawn_tasks :: proc(t: ^testing.T) {
 	init()
 
-	spawn(proc() {
-		fmt.println("Starting Thread 1...")
-		for i in 0 ..< 10 {
-			fmt.printfln("Thread 1: counter = %d", i)
-			_yield()
-		}
-		fmt.println("Finished Thread 1")
-	})
+	ok := spawn(proc() {}) 	// 1/2 threads
+	testing.expect(t, ok)
 
-	spawn(proc() {
-		fmt.println("Starting Thread 2...")
-		for i in 0 ..< 7 {
-			fmt.printfln("Thread 2: counter = %d", i)
-			_yield()
-		}
-		fmt.println("Finished Thread 2")
-	})
+	ok = spawn(proc() {}) 	// 2/2 threads
+	testing.expect(t, ok)
+
+	ok = spawn(proc() {}) 	// All threads are busy
+	testing.expect(t, ok == false)
 
 	run()
 }
